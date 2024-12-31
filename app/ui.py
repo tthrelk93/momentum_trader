@@ -5,8 +5,8 @@ import pandas as pd
 
 def setup_sidebar():
     st.sidebar.header("Configuration")
-    start_date = st.sidebar.date_input("Start Date", value=pd.to_datetime("2023-01-01"))
-    end_date = st.sidebar.date_input("End Date", value=pd.to_datetime("2023-12-31"))
+    start_date = st.sidebar.date_input("Start Date")
+    end_date = st.sidebar.date_input("End Date")
     ma_short = st.sidebar.slider("Short Moving Average Period", min_value=5, max_value=50, value=9)
     ma_long = st.sidebar.slider("Long Moving Average Period", min_value=10, max_value=200, value=21)
     momentum_period = st.sidebar.slider("Momentum Period", min_value=5, max_value=50, value=14)

@@ -3,9 +3,15 @@ import pandas as pd
 from config import setup_config
 from ui import setup_sidebar
 from data.fetch import get_sp500_tickers, fetch_stock_data
-from strategy.backtest import robust_backtesting, backtest_with_split
+from strategy.backtest import robust_backtesting, backtest_with_split, robust_backtesting_for_ticker
 from strategy.portfolio import suggest_portfolio
-from strategy.signals import generate_live_signals
+from strategy.signals import generate_live_signals, monitor_and_trade
+from datetime import datetime, timedelta
+import alpaca_trade_api as tradeapi
+from config import API_KEY, SECRET_KEY, BASE_URL
+
+api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
+
 
 # Initialize Streamlit Configuration
 setup_config()
@@ -13,73 +19,124 @@ setup_config()
 # UI Setup
 asset_universe, start_date, end_date, ma_short, ma_long, momentum_period, portfolio_value = setup_sidebar()
 
-# Fetch stock data
-if st.sidebar.button("Fetch All Data"):
+#def filter_valid_tickers(tickers):
+#    """
+#    Filters and returns valid tickers based on Alpaca's tradable assets.
+#    """
+#    valid_tickers = []
+#    for ticker in tickers:
+#        try:
+#            asset = api.get_asset(ticker)
+#            if asset.tradable and 'warrant' not in asset.classification.lower():
+#                valid_tickers.append(ticker)
+#        except Exception as e:
+#            print(f"Error validating ticker {ticker}: {e}")
+#    return valid_tickers
+
+def get_last_week_dates():
+    """
+    Calculate the start and end dates for the previous week.
+    Returns:
+        start_date (str): Start date in 'YYYY-MM-DD' format.
+        end_date (str): End date in 'YYYY-MM-DD' format.
+    """
+    today = datetime.utcnow()
+    end_date = today - timedelta(days=today.weekday() + 1)  # Last Sunday
+    start_date = end_date - timedelta(days=6)  # Previous Monday
+    return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+        
+
+
+if st.sidebar.button("Fetch Data and Find Movers"):
+    # Calculate last week's dates
+    start_date, end_date = get_last_week_dates()
+
+    # Fetch data for valid tickers
     tickers = asset_universe['US_Equities']
     fetched_data = fetch_stock_data(tickers, start_date, end_date)
     st.session_state['stock_data'] = fetched_data
-    st.success("Stock data fetched successfully!")
+
+    # Identify top movers based on momentum
+    movers = []
+    for ticker, data in fetched_data.items():
+        if not data.empty:
+            # Calculate momentum as percentage change from the start to end of the week
+            start_price = data['close'].iloc[0]
+            end_price = data['close'].iloc[-1]
+            momentum = (end_price - start_price) / start_price
+            movers.append({'ticker': ticker, 'momentum': momentum})
+
+    # Sort movers by momentum and take the top 10
+    movers = sorted(movers, key=lambda x: x['momentum'], reverse=True)[:10]
+    st.session_state['top_movers'] = [m['ticker'] for m in movers]
+
+    st.success("Data fetched and top movers identified!")
+    st.write("Top Movers for the Week:", st.session_state['top_movers'])
+
+
+    
 
 # Run Robust Backtesting
 if st.sidebar.button("Run Robust Backtesting"):
-    st.subheader("Robust Backtesting Results")
-    results = robust_backtesting(
-        asset_universe,
-        start_date,
-        end_date,
-        ma_short,
-        ma_long,
-        momentum_period,
-        portfolio_value
-    )
-    st.session_state['results'] = results  # Save results in session state
+    if 'top_movers' not in st.session_state or not st.session_state['top_movers']:
+        st.error("Please fetch data and identify top movers first!")
+    else:
+        st.subheader("Robust Backtesting Results")
 
-    # Display top 10 stocks by momentum
-    top_results = sorted(results, key=lambda x: float(x['Final_Balance']), reverse=True)[:10]  # Ensure numeric sorting
-    st.subheader("Top 10 Momentum Stocks")
+        # Filter fetched data to only include the top movers
+        top_movers_data = {ticker: st.session_state['stock_data'][ticker] for ticker in st.session_state['top_movers']}
 
-    # Debug: Log top results
-    print(f"Top Results Debug: {top_results}")
+        # Perform backtesting on the top movers
+        results = robust_backtesting(
+            top_movers_data,  # Use only the data for top movers
+            ma_short,
+            ma_long,
+            momentum_period,
+            portfolio_value
+        )
+        st.session_state['results'] = results  # Save results in session state
 
-    for i, result in enumerate(top_results, start=1):
-        try:
-            # Ensure numeric values for display
-            final_balance = float(result['Final_Balance'])  # Explicitly cast Final_Balance to float
-            sharpe_ratio = float(result['Sharpe_Ratio'])
-            sortino_ratio = float(result['Sortino_Ratio'])
-            max_drawdown = float(result['Max_Drawdown'])
-            skewness = float(result['Skewness'])
-            tail_risk = float(result['Tail_Risk'])
-            volatility_adjusted_return = float(result.get('Volatility_Adjusted_Return', '0'))
+        # Display top results by Final Balance
+        top_results = sorted(results, key=lambda x: float(x['Final_Balance']), reverse=True)[:10]  # Top 10 movers
+        st.subheader("Top 10 Momentum Stocks")
+        print(f"Top Results Debug: {top_results}")
 
-            st.write(
-                f"{i}. Ticker: {result['Ticker']} | Final Balance: ${final_balance:,.2f} | "
-                f"Sharpe Ratio: {sharpe_ratio:.2f} | Sortino Ratio: {sortino_ratio:.2f} | "
-                f"Max Drawdown: {max_drawdown:.2%} | Skewness: {skewness:.2f} | "
-                f"Tail Risk: {tail_risk:.2f} | Volatility-Adjusted Return: {volatility_adjusted_return:.2f}"
-            )
-            st.line_chart(result['Performance_History'])  # Chart performance history
+        for i, result in enumerate(top_results, start=1):
+            try:
+                # Display each stock's performance metrics
+                final_balance = float(result['Final_Balance'])  # Explicitly cast to float
+                sharpe_ratio = float(result['Sharpe_Ratio'])
+                sortino_ratio = float(result['Sortino_Ratio'])
+                max_drawdown = float(result['Max_Drawdown'])
+                skewness = float(result['Skewness'])
+                tail_risk = float(result['Tail_Risk'])
 
-        except (ValueError, TypeError, KeyError) as e:
-            # Log problematic results
-            print(f"Error processing result: {result}. Error: {e}")
-            st.warning(f"Skipping result for ticker {result.get('Ticker', 'Unknown')}: {e}")
+                st.write(
+                    f"{i}. Ticker: {result['Ticker']} | Final Balance: ${final_balance:,.2f} | "
+                    f"Sharpe Ratio: {sharpe_ratio:.2f} | Sortino Ratio: {sortino_ratio:.2f} | "
+                    f"Max Drawdown: {max_drawdown:.2%} | Skewness: {skewness:.2f} | "
+                    f"Tail Risk: {tail_risk:.2f} "
+                )
+                st.line_chart(result['Performance_History'])  # Chart performance history
 
-    # Display Risk Analysis Summary
-    st.subheader("Risk Analysis Summary")
-    for result in top_results:
-        try:
-            risk_report = f"""
-            **Ticker:** {result['Ticker']}
-            - **Maximum Drawdown:** {float(result['Max_Drawdown']):.2%}
-            - **Return Skewness:** {float(result['Skewness']):.2f} (Positive = Right-skewed, Negative = Left-skewed)
-            - **Tail Risk:** {float(result['Tail_Risk']):.2f} (Proportion of returns below -5%)
-            - **Volatility-Adjusted Return:** {float(result.get('Volatility_Adjusted_Return', '0')):.2f}
-            """
-            st.markdown(risk_report)
-        except (ValueError, TypeError, KeyError) as e:
-            print(f"Error creating risk report for ticker {result.get('Ticker', 'Unknown')}: {e}")
-            st.warning(f"Unable to display risk report for ticker {result.get('Ticker', 'Unknown')}: {e}")
+            except (ValueError, TypeError, KeyError) as e:
+                print(f"Error processing result: {result}. Error: {e}")
+                st.warning(f"Skipping result for ticker {result.get('Ticker', 'Unknown')}: {e}")
+
+        # Display Risk Analysis Summary
+        st.subheader("Risk Analysis Summary")
+        for result in top_results:
+            try:
+                risk_report = f"""
+                **Ticker:** {result['Ticker']}
+                - **Maximum Drawdown:** {float(result['Max_Drawdown']):.2%}
+                - **Return Skewness:** {float(result['Skewness']):.2f} (Positive = Right-skewed, Negative = Left-skewed)
+                - **Tail Risk:** {float(result['Tail_Risk']):.2f} (Proportion of returns below -5%)
+                """
+                st.markdown(risk_report)
+            except (ValueError, TypeError, KeyError) as e:
+                print(f"Error creating risk report for ticker {result.get('Ticker', 'Unknown')}: {e}")
+                st.warning(f"Unable to display risk report for ticker {result.get('Ticker', 'Unknown')}: {e}")
 
 
 # Portfolio Suggestions
@@ -143,7 +200,7 @@ if st.sidebar.button("Run Out-of-Sample Testing"):
         else:
             # Display overall summary
             st.write("Summary of Out-of-Sample Testing")
-            st.bar_chart(results_df.set_index('Ticker')[['Training_Final_Balance', 'Testing_Final_Balance']])
+            st.bar_chart(results_df.set_index('ticker')[['Training_Final_Balance', 'Testing_Final_Balance']])
 
             # Display detailed results
             st.write("Detailed Results")
@@ -153,5 +210,22 @@ if st.sidebar.button("Run Out-of-Sample Testing"):
 if st.sidebar.button("Get Live Signals"):
     st.subheader("Live Signals")
     for ticker in st.session_state['stock_data']:
-        signal = generate_live_signals(ticker)
+        signal = generate_live_signals(ticker, ma_short,
+        ma_long,
+        momentum_period)
         st.write(f"Ticker: {ticker}, Signal: {signal}")
+        
+if st.sidebar.button("Start Live Trading"):
+    if 'top_movers' not in st.session_state or not st.session_state['top_movers']:
+        st.error("Please fetch data and identify top movers first!")
+    else:
+        tickers = st.session_state['top_movers']
+#        valid_tickers = filter_valid_tickers(tickers)  # Ensure valid tickers
+        if not tickers:
+            st.error("No valid tickers available for live trading.")
+        else:
+            st.success(f"Live trading started for: {', '.join(tickers)}")
+            monitor_and_trade(tickers, ma_short, ma_long, momentum_period=7)
+
+
+
